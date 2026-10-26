@@ -1,5 +1,37 @@
-          choco install tightvnc --yes --no-progress `
-            --install-arguments="SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=$env:VNC_PASSWORD"
+name: Temporary Windows Desktop (noVNC + Cloudflare)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Check VNC password secret
+        shell: pwsh
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
+            throw "Create a repository secret named VNC_PASSWORD first."
+          }
+          if ($env:VNC_PASSWORD.Length -gt 8) {
+            throw "VNC_PASSWORD must be 8 characters or fewer for TightVNC compatibility."
+          }
+
+      - name: Install TightVNC
+        shell: pwsh
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installArgs = "SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=$env:VNC_PASSWORD"
+          choco install tightvnc --yes --no-progress --install-arguments="$installArgs"
           $service = Get-Service -Name tvnserver -ErrorAction SilentlyContinue
           if ($null -eq $service) {
             throw "TightVNC service was not found after installation."
@@ -15,17 +47,30 @@
           $ErrorActionPreference = "Stop"
           python -m pip install --upgrade pip
           python -m pip install websockify
+
           $zip = "$env:TEMP\novnc.zip"
+          $sourceDir = "$env:TEMP\novnc-src"
           $dest = "C:\novnc"
-          Invoke-WebRequest `
-            -Uri "https://github.com/novnc/noVNC/archive/refs/heads/master.zip" `
-            -OutFile $zip
-          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-          Expand-Archive -Path $zip -DestinationPath "$env:TEMP\novnc-src" -Force
-          $source = Get-ChildItem "$env:TEMP\novnc-src" -Directory | Select-Object -First 1
+
+          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/heads/master.zip" -OutFile $zip
+
+          if (Test-Path -LiteralPath $sourceDir) {
+            Remove-Item -LiteralPath $sourceDir -Recurse -Force
+          }
+          if (Test-Path -LiteralPath $dest) {
+            Remove-Item -LiteralPath $dest -Recurse -Force
+          }
+
+          Expand-Archive -Path $zip -DestinationPath $sourceDir -Force
+          $source = Get-ChildItem -LiteralPath $sourceDir -Directory | Select-Object -First 1
+          if ($null -eq $source) {
+            throw "Could not find the extracted noVNC directory."
+          }
+
           New-Item -ItemType Directory -Path $dest -Force | Out-Null
-          Copy-Item "$($source.FullName)\*" $dest -Recurse -Force
-          if (-not (Test-Path "$dest\vnc.html")) {
+          Copy-Item -Path "$($source.FullName)\*" -Destination $dest -Recurse -Force
+
+          if (-not (Test-Path -LiteralPath "$dest\vnc.html")) {
             throw "Could not find noVNC vnc.html after extraction."
           }
           Write-Host "noVNC installed at $dest"
@@ -35,7 +80,6 @@
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Start noVNC's web server and WebSocket proxy.
           $websockifyOut = "$env:TEMP\websockify-out.log"
           $websockifyErr = "$env:TEMP\websockify-err.log"
           $websockify = Start-Process -FilePath "python" `
@@ -44,85 +88,9 @@
             -RedirectStandardOutput $websockifyOut `
             -RedirectStandardError $websockifyErr
 
-          # Download cloudflared.
           $cloudflared = "$env:TEMP\cloudflared.exe"
-          Invoke-WebRequest `
-            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
-            -OutFile $cloudflared
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cloudflared
 
           $cfOut = "$env:TEMP\cloudflared-out.log"
           $cfErr = "$env:TEMP\cloudflared-err.log"
           $tunnel = Start-Process -FilePath $cloudflared `
-            -ArgumentList @("tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:6080") `
-            -PassThru `
-            -RedirectStandardOutput $cfOut `
-            -RedirectStandardError $cfErr
-
-          $url = $null
-          for ($i = 0; $i -lt 90; $i++) {
-            Start-Sleep -Seconds 2
-
-            foreach ($log in @($cfOut, $cfErr)) {
-              if (Test-Path -LiteralPath $log) {
-                $matches = Select-String -LiteralPath $log `
-                  -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' `
-                  -AllMatches -ErrorAction SilentlyContinue
-
-                if ($matches) {
-                  foreach ($line in $matches) {
-                    if ($line.Matches.Count -gt 0) {
-                      $url = $line.Matches[0].Value
-                      break
-                    }
-                  }
-                }
-              }
-
-              if ($url) {
-                break
-              }
-            }
-
-            if ($url) {
-              break
-            }
-
-            if ($tunnel.HasExited) {
-              Write-Host "cloudflared stdout:"
-              if (Test-Path -LiteralPath $cfOut) { Get-Content -LiteralPath $cfOut }
-              Write-Host "cloudflared stderr:"
-              if (Test-Path -LiteralPath $cfErr) { Get-Content -LiteralPath $cfErr }
-              throw "cloudflared exited before creating a tunnel."
-            }
-          }
-
-          if (-not $url) {
-            Write-Host "cloudflared stdout:"
-            if (Test-Path -LiteralPath $cfOut) { Get-Content -LiteralPath $cfOut }
-            Write-Host "cloudflared stderr:"
-            if (Test-Path -LiteralPath $cfErr) { Get-Content -LiteralPath $cfErr }
-            throw "Could not find the Quick Tunnel URL in cloudflared logs."
-          }
-
-          $summary = @(
-            "## Temporary Windows desktop"
-            ""
-            "Open: $url/vnc.html"
-            ""
-            "VNC password: the repository secret VNC_PASSWORD (not displayed here)."
-            ""
-            "Keep this workflow running while using the desktop."
-          )
-          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-          Write-Host "noVNC URL: $url/vnc.html"
-          Write-Host "Keep this workflow running while using the desktop."
-
-          while (-not $tunnel.HasExited -and -not $websockify.HasExited) {
-            Start-Sleep -Seconds 15
-          }
-
-          Write-Host "websockify stdout:"
-          if (Test-Path -LiteralPath $websockifyOut) { Get-Content -LiteralPath $websockifyOut }
-          Write-Host "websockify stderr:"
-          if (Test-Path -LiteralPath $websockifyErr) { Get-Content -LiteralPath $websockifyErr }
