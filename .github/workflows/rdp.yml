@@ -111,6 +111,7 @@ jobs:
               "websockify",
               "--web",
               "C:\novnc",
+              "--allow-loopback",
               "127.0.0.1:6080",
               "127.0.0.1:5900"
             ) `
