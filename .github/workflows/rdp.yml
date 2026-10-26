@@ -1,4 +1,5 @@
-name: Temporary Windows Desktop (noVNC + Cloudflare)
+```yaml
+name: Windows VPS - noVNC Cloudflare
 
 on:
   workflow_dispatch:
@@ -12,16 +13,17 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Check VNC password secret
+      - name: Check VNC password
         shell: pwsh
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:VNC_PASSWORD)) {
-            throw "Create a repository secret named VNC_PASSWORD first."
+            throw "Please add repository secret VNC_PASSWORD."
           }
+
           if ($env:VNC_PASSWORD.Length -gt 8) {
-            throw "VNC_PASSWORD must be 8 characters or fewer for TightVNC compatibility."
+            throw "VNC_PASSWORD must be 8 characters or fewer."
           }
 
       - name: Install TightVNC
@@ -30,21 +32,29 @@ jobs:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
+
           $installArgs = "SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=$env:VNC_PASSWORD"
+
           choco install tightvnc --yes --no-progress --install-arguments="$installArgs"
+
           $service = Get-Service -Name tvnserver -ErrorAction SilentlyContinue
+
           if ($null -eq $service) {
-            throw "TightVNC service was not found after installation."
+            throw "TightVNC service was not found."
           }
+
           Set-Service -Name tvnserver -StartupType Automatic
           Start-Service -Name tvnserver
+
           Start-Sleep -Seconds 3
-          Get-Service -Name tvnserver | Format-Table -AutoSize
+
+          Get-Service -Name tvnserver
 
       - name: Install noVNC and websockify
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           python -m pip install --upgrade pip
           python -m pip install websockify
 
@@ -52,45 +62,194 @@ jobs:
           $sourceDir = "$env:TEMP\novnc-src"
           $dest = "C:\novnc"
 
-          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/heads/master.zip" -OutFile $zip
+          Invoke-WebRequest `
+            -Uri "https://github.com/novnc/noVNC/archive/refs/heads/master.zip" `
+            -OutFile $zip
 
           if (Test-Path -LiteralPath $sourceDir) {
             Remove-Item -LiteralPath $sourceDir -Recurse -Force
           }
+
           if (Test-Path -LiteralPath $dest) {
             Remove-Item -LiteralPath $dest -Recurse -Force
           }
 
           Expand-Archive -Path $zip -DestinationPath $sourceDir -Force
-          $source = Get-ChildItem -LiteralPath $sourceDir -Directory | Select-Object -First 1
+
+          $source = Get-ChildItem -LiteralPath $sourceDir -Directory |
+            Select-Object -First 1
+
           if ($null -eq $source) {
-            throw "Could not find the extracted noVNC directory."
+            throw "Could not find extracted noVNC directory."
           }
 
           New-Item -ItemType Directory -Path $dest -Force | Out-Null
-          Copy-Item -Path "$($source.FullName)\*" -Destination $dest -Recurse -Force
+
+          Copy-Item `
+            -Path "$($source.FullName)\*" `
+            -Destination $dest `
+            -Recurse -Force
 
           if (-not (Test-Path -LiteralPath "$dest\vnc.html")) {
-            throw "Could not find noVNC vnc.html after extraction."
+            throw "noVNC vnc.html was not found."
           }
-          Write-Host "noVNC installed at $dest"
+
+          Write-Host "noVNC installed successfully."
 
       - name: Start noVNC and Cloudflare Quick Tunnel
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
+          # Start the noVNC web client and WebSocket proxy.
           $websockifyOut = "$env:TEMP\websockify-out.log"
           $websockifyErr = "$env:TEMP\websockify-err.log"
-          $websockify = Start-Process -FilePath "python" `
-            -ArgumentList @("-m", "websockify", "--web", "C:\novnc", "127.0.0.1:6080", "127.0.0.1:5900") `
+
+          $websockify = Start-Process `
+            -FilePath "python" `
+            -ArgumentList @(
+              "-m",
+              "websockify",
+              "--web",
+              "C:\novnc",
+              "127.0.0.1:6080",
+              "127.0.0.1:5900"
+            ) `
             -PassThru `
             -RedirectStandardOutput $websockifyOut `
             -RedirectStandardError $websockifyErr
 
+          Start-Sleep -Seconds 3
+
+          if ($websockify.HasExited) {
+            if (Test-Path $websockifyOut) {
+              Get-Content $websockifyOut
+            }
+
+            if (Test-Path $websockifyErr) {
+              Get-Content $websockifyErr
+            }
+
+            throw "websockify failed to start."
+          }
+
+          # Download Cloudflare cloudflared.
           $cloudflared = "$env:TEMP\cloudflared.exe"
-          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cloudflared
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" `
+            -OutFile $cloudflared
 
           $cfOut = "$env:TEMP\cloudflared-out.log"
           $cfErr = "$env:TEMP\cloudflared-err.log"
-          $tunnel = Start-Process -FilePath $cloudflared `
+
+          $tunnel = Start-Process `
+            -FilePath $cloudflared `
+            -ArgumentList @(
+              "tunnel",
+              "--no-autoupdate",
+              "--url",
+              "http://127.0.0.1:6080"
+            ) `
+            -PassThru `
+            -RedirectStandardOutput $cfOut `
+            -RedirectStandardError $cfErr
+
+          # Wait for the public Quick Tunnel URL.
+          $url = $null
+
+          for ($i = 0; $i -lt 90; $i++) {
+            Start-Sleep -Seconds 2
+
+            foreach ($log in @($cfOut, $cfErr)) {
+              if (Test-Path -LiteralPath $log) {
+                $lines = Select-String `
+                  -LiteralPath $log `
+                  -Pattern 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' `
+                  -AllMatches `
+                  -ErrorAction SilentlyContinue
+
+                foreach ($line in $lines) {
+                  if ($line.Matches.Count -gt 0) {
+                    $url = $line.Matches[0].Value
+                    break
+                  }
+                }
+              }
+
+              if ($url) {
+                break
+              }
+            }
+
+            if ($url) {
+              break
+            }
+
+            if ($tunnel.HasExited) {
+              throw "cloudflared exited before creating a tunnel."
+            }
+          }
+
+          if (-not $url) {
+            Write-Host "Cloudflare stdout:"
+            if (Test-Path $cfOut) {
+              Get-Content $cfOut
+            }
+
+            Write-Host "Cloudflare stderr:"
+            if (Test-Path $cfErr) {
+              Get-Content $cfErr
+            }
+
+            throw "Could not obtain the Cloudflare Quick Tunnel URL."
+          }
+
+          # Print the URL in the Actions log.
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " WINDOWS DESKTOP READY"
+          Write-Host " noVNC URL: $url/vnc.html"
+          Write-Host " Tunnel URL: $url"
+          Write-Host "=============================================="
+          Write-Host ""
+
+          # Add the URL to the workflow Summary.
+          @(
+            "## Windows Desktop"
+            ""
+            "noVNC URL: $url/vnc.html"
+            ""
+            "Tunnel URL: $url"
+            ""
+            "Use the password stored in repository secret VNC_PASSWORD."
+            ""
+            "Keep this workflow running while using the desktop."
+          ) | Out-File `
+            -FilePath $env:GITHUB_STEP_SUMMARY `
+            -Append `
+            -Encoding utf8
+
+          # Keep the job alive while both processes are running.
+          while ($true) {
+            Start-Sleep -Seconds 15
+
+            if ($tunnel.HasExited) {
+              Write-Host "Cloudflare tunnel stopped."
+              if (Test-Path $cfErr) {
+                Get-Content $cfErr
+              }
+              throw "Cloudflare tunnel process exited."
+            }
+
+            if ($websockify.HasExited) {
+              Write-Host "noVNC proxy stopped."
+              if (Test-Path $websockifyErr) {
+                Get-Content $websockifyErr
+              }
+              throw "websockify process exited."
+            }
+
+            Write-Host "Keep-alive: tunnel and noVNC proxy are running."
+          }
+```
