@@ -1,4 +1,3 @@
-```yaml
 name: Windows VPS - noVNC Cloudflare
 
 on:
@@ -252,4 +251,3 @@ jobs:
 
             Write-Host "Keep-alive: tunnel and noVNC proxy are running."
           }
-```
